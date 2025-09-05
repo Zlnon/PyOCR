@@ -1,0 +1,12 @@
+# env files
+.env
+
+# google credentials
+google-credentials.json
+
+# output files
+output/
+
+# images
+# images/
+

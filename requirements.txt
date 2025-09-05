@@ -1,0 +1,17 @@
+# OCR and Computer Vision
+google-cloud-vision==3.7.2
+
+# Data validation and modeling
+pydantic==2.8.2
+
+# Data manipulation and Excel export
+pandas==2.2.2
+openpyxl==3.1.2
+
+# Environment variables management
+python-dotenv==1.0.1
+
+# Additional utilities
+Pillow==10.4.0  # Image processing
+pathlib2==2.3.7  # Enhanced path handling (for older Python versions)
+typing-extensions==4.12.2  # Enhanced type hints
