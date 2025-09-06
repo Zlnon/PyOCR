@@ -17,12 +17,12 @@ import re
 from datetime import date, datetime, time
 from typing import List, Optional, Tuple, Dict, Any
 from fuzzywuzzy import fuzz, process
-from schemas.driver_log_schema import DriverLogEntry, DriverLogData
+from schemas.driver_log_schema import DriverLogEntry, DriverLogData, LocationVisit
 from config import (
     KNOWN_DRIVERS, KNOWN_VEHICLES, KNOWN_LOCATIONS,
-    DRIVER_NAME_CORRECTIONS, VEHICLE_ID_CORRECTIONS,
+    DRIVER_NAME_CORRECTIONS, VEHICLE_ID_CORRECTIONS, LOCATION_CORRECTIONS,
     CONFIDENCE_THRESHOLDS, ENHANCED_PATTERNS,
-    MIN_CONFIDENCE_SCORES, is_reasonable_value
+    MIN_CONFIDENCE_SCORES, is_reasonable_value, get_location_category
 )
 
 
@@ -558,5 +558,561 @@ class EnhancedDriverLogParser:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(1).strip()
+        
+        return None
+    
+    def extract_location_visits(self, text: str, source_file: str = "unknown") -> List[LocationVisit]:
+        """
+        Extract individual location visits from OCR text.
+        Each location visit becomes a separate record.
+        
+        Args:
+            text: Raw OCR text from the image
+            source_file: Name of the source image file
+            
+        Returns:
+            List of LocationVisit objects
+        """
+        visits = []
+        
+        try:
+            # Extract basic information that applies to all visits
+            driver_name, _ = self._extract_driver_name_fuzzy(text)
+            log_date, _ = self._extract_date_with_confidence(text)
+            vehicle_id, _ = self._extract_vehicle_id_fuzzy(text)
+            labor_name = self._extract_labor_name_from_form(text)
+            
+            if not driver_name:
+                driver_name = "Unknown Driver"
+            if not log_date:
+                log_date = date.today()
+            
+            # Enhanced pattern to find location-time combinations
+            location_time_patterns = [
+                # Pattern: Location Time Time (e.g., "Al Khor 7:45 AM 9:40 AM")
+                r'([A-Za-z\s]{3,25})\s+(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)\s+(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)',
+                
+                # Pattern: Time Location Time (e.g., "7:45 Al Khor 9:40")
+                r'(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)\s+([A-Za-z\s]{3,25})\s+(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)',
+                
+                # Pattern: Location Time (single time)
+                r'([A-Za-z\s]{3,25})\s+(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)',
+            ]
+            
+            # Add pattern for known locations
+            if KNOWN_LOCATIONS:
+                known_locations_pattern = r'((?:' + '|'.join(re.escape(loc) for loc in KNOWN_LOCATIONS) + r'))\s*(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)\s*(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)?'
+                location_time_patterns.append(known_locations_pattern)
+            
+            visit_sequence = 1
+            
+            # Try each pattern
+            for pattern in location_time_patterns:
+                matches = re.finditer(pattern, text, re.IGNORECASE)
+                
+                for match in matches:
+                    groups = match.groups()
+                    location = None
+                    arrival_time = None
+                    departure_time = None
+                    
+                    # Parse based on pattern structure
+                    if len(groups) >= 3 and groups[2]:
+                        if re.match(r'\d', groups[0]):  # First group is time
+                            arrival_time = self._parse_time(groups[0])
+                            location = groups[1].strip()
+                            departure_time = self._parse_time(groups[2])
+                        else:  # First group is location
+                            location = groups[0].strip()
+                            arrival_time = self._parse_time(groups[1])
+                            departure_time = self._parse_time(groups[2])
+                    elif len(groups) >= 2:
+                        if re.match(r'\d', groups[0]):  # First group is time
+                            arrival_time = self._parse_time(groups[0])
+                            location = groups[1].strip()
+                        else:  # First group is location
+                            location = groups[0].strip()
+                            arrival_time = self._parse_time(groups[1])
+                    
+                    # Clean and validate location
+                    if location and len(location.strip()) > 2:
+                        location = location.strip()
+                        
+                        # Apply location corrections
+                        for mistake, correction in LOCATION_CORRECTIONS.items():
+                            if mistake.lower() in location.lower():
+                                location = correction
+                                print(f"🔧 Corrected location '{mistake}' to '{correction}'")
+                                break
+                        
+                        # Try fuzzy matching against known locations
+                        if KNOWN_LOCATIONS:
+                            match_result = process.extractOne(location, KNOWN_LOCATIONS, scorer=fuzz.partial_ratio)
+                            if match_result and match_result[1] >= 70:
+                                matched_location = match_result[0]
+                                if matched_location != location:
+                                    print(f"🎯 Fuzzy matched location '{location}' to '{matched_location}' (score: {match_result[1]})")
+                                    location = matched_location
+                        
+                        # Get location category
+                        location_category = get_location_category(location)
+                        
+                        # Create location visit
+                        visit = LocationVisit(
+                            driver_name=driver_name,
+                            log_date=log_date,
+                            location=location,
+                            arrival_time=arrival_time,
+                            departure_time=departure_time,
+                            vehicle_id=vehicle_id,
+                            labor_name=labor_name,
+                            location_category=location_category,
+                            source_image=source_file,
+                            visit_sequence=visit_sequence,
+                            notes=f"Extracted from {source_file}"
+                        )
+                        
+                        visits.append(visit)
+                        visit_sequence += 1
+                        
+                        print(f"📍 Found visit: {driver_name} -> {location} ({location_category}) {arrival_time or 'N/A'}-{departure_time or 'N/A'}")
+            
+            # If no structured visits found, try to extract locations and times separately
+            if not visits:
+                locations = self._extract_all_locations_from_text(text)
+                times = self._extract_all_times_from_text(text)
+                
+                # Pair locations with times if we have them
+                for i, location in enumerate(locations):
+                    arrival_time = times[i*2] if i*2 < len(times) else None
+                    departure_time = times[i*2+1] if i*2+1 < len(times) else None
+                    
+                    location_category = get_location_category(location)
+                    
+                    visit = LocationVisit(
+                        driver_name=driver_name,
+                        log_date=log_date,
+                        location=location,
+                        arrival_time=arrival_time,
+                        departure_time=departure_time,
+                        vehicle_id=vehicle_id,
+                        labor_name=labor_name,
+                        location_category=location_category,
+                        source_image=source_file,
+                        visit_sequence=i+1,
+                        notes=f"Extracted from {source_file} (fallback method)"
+                    )
+                    
+                    visits.append(visit)
+                    print(f"📍 Found visit (fallback): {driver_name} -> {location} ({location_category})")
+                    
+        except Exception as e:
+            print(f"❌ Error extracting location visits: {str(e)}")
+            
+        return visits
+
+    def extract_from_structured_form(self, text: str, source_file: str = "unknown") -> List[LocationVisit]:
+        """
+        Enhanced extraction specifically for the structured driver log forms.
+        Handles the table format with Time Arrived | Time Departed | Location & Purpose columns.
+        
+        Args:
+            text: Raw OCR text from the structured form
+            source_file: Name of the source image file
+            
+        Returns:
+            List of LocationVisit objects
+        """
+        visits = []
+        
+        try:
+            # Extract header information using enhanced methods
+            driver_name = self._extract_driver_name_from_form(text)
+            vehicle_id = self._extract_vehicle_from_form(text)
+            log_date = self._extract_date_from_form(text)
+            labor_name = self._extract_labor_name_from_form(text)
+            
+            if not driver_name:
+                driver_name = "Unknown Driver"
+            if not log_date:
+                log_date = date.today()
+            
+            # Look for table data - more structured approach
+            table_rows = self._extract_table_rows(text)
+            
+            visit_sequence = 1
+            for row in table_rows:
+                arrival_time = self._parse_time(row.get('time_arrived'))
+                departure_time = self._parse_time(row.get('time_departed'))
+                location = row.get('location')
+                notes = row.get('notes', '')
+                
+                if location and location.strip():
+                    # Clean and correct location
+                    location = self._clean_location(location)
+                    location_category = get_location_category(location)
+                    
+                    visit = LocationVisit(
+                        driver_name=driver_name,
+                        log_date=log_date,
+                        location=location,
+                        arrival_time=arrival_time,
+                        departure_time=departure_time,
+                        vehicle_id=vehicle_id,
+                        labor_name=labor_name,
+                        location_category=location_category,
+                        source_image=source_file,
+                        visit_sequence=visit_sequence,
+                        notes=notes
+                    )
+                    
+                    visits.append(visit)
+                    visit_sequence += 1
+                    print(f"📋 Form visit: {driver_name} -> {location} ({location_category}) {arrival_time or 'N/A'}-{departure_time or 'N/A'}")
+            
+        except Exception as e:
+            print(f"❌ Error extracting from structured form: {str(e)}")
+            # Fallback to regular extraction
+            return self.extract_location_visits(text, source_file)
+            
+        return visits if visits else self.extract_location_visits(text, source_file)
+
+    def _parse_time(self, time_str: str) -> Optional[time]:
+        """Parse a time string into a time object with better AM/PM handling."""
+        if not time_str:
+            return None
+            
+        time_str = time_str.strip().upper()
+        
+        # Enhanced time patterns with better AM/PM detection
+        patterns = [
+            r'(\d{1,2})[:.:](\d{2})\s*(AM|PM)',      # 12:30 AM/PM
+            r'(\d{1,2})\s*(AM|PM)',                  # 12 AM/PM
+            r'(\d{1,2})[:.:](\d{2})',                # 12:30 (24-hour assumed)
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, time_str)
+            if match:
+                try:
+                    hour = int(match.group(1))
+                    minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) and match.group(2).isdigit() else 0
+                    am_pm = match.group(3) if len(match.groups()) >= 3 and match.group(3) else None
+                    
+                    # Convert to 24-hour format
+                    if am_pm == 'PM' and hour != 12:
+                        hour += 12
+                    elif am_pm == 'AM' and hour == 12:
+                        hour = 0
+                    elif not am_pm and hour <= 12:
+                        # If no AM/PM specified and hour is 1-12, try to guess based on context
+                        # For now, assume times 1-7 are PM (13:00-19:00), 8-12 are AM
+                        if 1 <= hour <= 7:
+                            hour += 12
+                    
+                    # Validate hour and minute
+                    if 0 <= hour <= 23 and 0 <= minute <= 59:
+                        return time(hour, minute)
+                except (ValueError, IndexError, TypeError):
+                    continue
+        
+        return None
+
+    def _extract_all_locations_from_text(self, text: str) -> List[str]:
+        """Extract all possible locations from text."""
+        locations = []
+        
+        # Look for known locations in text
+        for location in KNOWN_LOCATIONS:
+            if location.lower() in text.lower():
+                locations.append(location)
+        
+        # Look for correctable locations
+        for mistake, correction in LOCATION_CORRECTIONS.items():
+            if mistake.lower() in text.lower():
+                locations.append(correction)
+        
+        return list(set(locations))  # Remove duplicates
+
+    def _extract_all_times_from_text(self, text: str) -> List[time]:
+        """Extract all possible times from text."""
+        times = []
+        
+        # Time patterns
+        time_patterns = [
+            r'\b(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm))\b',
+            r'\b(\d{1,2}\s*(?:AM|PM|am|pm))\b',
+        ]
+        
+        for pattern in time_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                parsed_time = self._parse_time(match)
+                if parsed_time:
+                    times.append(parsed_time)
+        
+        return times
+
+    def _extract_driver_name_from_form(self, text: str) -> Optional[str]:
+        """Extract driver name specifically from form header."""
+        # Look for "Driver Name:" pattern - more specific patterns first
+        patterns = [
+            r'Driver Name[:\s]*([A-Za-z\s]{2,25})(?:\s*Time|\s*Labor|\s*Vehicle|\s*Date|\s*Instructions|$)',
+            r'Driver[:\s]*([A-Za-z\s]{2,25})(?:\s*Time|\s*Labor|\s*Vehicle|\s*Date|\s*Instructions|$)',
+            r'Name[:\s]*([A-Za-z\s]{2,25})(?:\s*Time|\s*Labor|\s*Vehicle|\s*Date|\s*Instructions|$)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up common form text that gets mixed in
+                name = re.sub(r'\b(Time Started|Time Ended|Labor|Labour|Instructions|Vehicle|Date|Work)\b.*', '', name, flags=re.IGNORECASE).strip()
+                
+                if len(name) >= 3 and not re.search(r'\b(Time|Started|Ended|Work|Labor|Labour|Instructions|Vehicle|Date)\b', name, re.IGNORECASE):
+                    # Apply corrections and fuzzy matching
+                    return self._correct_and_match_driver_name(name)
+        
+        # Fallback to regular extraction
+        driver_name, _ = self._extract_driver_name_fuzzy(text)
+        return driver_name
+
+    def _extract_vehicle_from_form(self, text: str) -> Optional[str]:
+        """Extract vehicle ID specifically from form header."""
+        # Look for "Vehicle ID / Plate:" pattern
+        patterns = [
+            r'Vehicle ID[/\s]*Plate[:\s]*([0-9]{5,6})',
+            r'Vehicle[:\s]*([0-9]{5,6})',
+            r'Plate[:\s]*([0-9]{5,6})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                vehicle = match.group(1).strip()
+                # Check if it's in our known vehicles
+                if vehicle in KNOWN_VEHICLES:
+                    return vehicle
+                # Apply corrections
+                for mistake, correction in VEHICLE_ID_CORRECTIONS.items():
+                    if mistake == vehicle:
+                        return correction
+                return vehicle
+        
+        # Fallback to regular extraction
+        vehicle_id, _ = self._extract_vehicle_id_fuzzy(text)
+        return vehicle_id
+
+    def _extract_date_from_form(self, text: str) -> Optional[date]:
+        """Extract date specifically from form header."""
+        # Look for "Date:" pattern
+        date_patterns = [
+            r'Date[:\s]*(\d{2}[-/]\d{2}[-/]\d{2,4})',
+            r'Date[:\s]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})',
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1)
+                return self._parse_date(date_str)
+        
+        # Fallback to regular extraction
+        log_date, _ = self._extract_date_with_confidence(text)
+        return log_date
+
+    def _extract_labor_name_from_form(self, text: str) -> Optional[str]:
+        """Extract labor name specifically from form header."""
+        # Look for "Labor Name:" pattern - more specific patterns to avoid form text
+        patterns = [
+            r'Labor Name[:\s]*([A-Za-z\s]{2,25})(?:\s*Time|\s*Driver|\s*Vehicle|\s*Date|\s*Instructions|$)',
+            r'Labour Name[:\s]*([A-Za-z\s]{2,25})(?:\s*Time|\s*Driver|\s*Vehicle|\s*Date|\s*Instructions|$)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up common form text that gets mixed in
+                name = re.sub(r'\b(Time Started|Time Ended|Driver|Vehicle|Date|Work|Instructions)\b.*', '', name, flags=re.IGNORECASE).strip()
+                
+                if len(name) >= 3 and not re.search(r'\b(Time|Started|Ended|Work|Driver|Vehicle|Date|Instructions)\b', name, re.IGNORECASE):
+                    # Apply corrections and fuzzy matching
+                    return self._correct_and_match_driver_name(name)
+        
+        return None
+
+    def _extract_table_rows(self, text: str) -> List[Dict[str, str]]:
+        """Extract rows from the movement log table."""
+        rows = []
+        
+        # Split text into lines and look for table-like patterns
+        lines = text.split('\n')
+        
+        for line in lines:
+            # Skip header lines and empty lines
+            if any(header in line.lower() for header in ['time arrived', 'time departed', 'location', 'instructions']):
+                continue
+            if not line.strip():
+                continue
+            
+            # Enhanced time patterns to catch more variations
+            time_patterns = [
+                r'\b(\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm))\b',  # With AM/PM
+                r'\b(\d{1,2}[:.]\d{2})\b',  # Without AM/PM
+                r'\b(\d{1,2}\s*(?:AM|PM|am|pm))\b',  # Just hour with AM/PM
+            ]
+            
+            all_times = []
+            for pattern in time_patterns:
+                times = re.findall(pattern, line, re.IGNORECASE)
+                all_times.extend(times)
+            
+            # Remove duplicates while preserving order
+            time_matches = []
+            seen = set()
+            for time_str in all_times:
+                if time_str not in seen:
+                    time_matches.append(time_str)
+                    seen.add(time_str)
+            
+            if len(time_matches) >= 2:
+                # Likely a table row with arrival and departure times
+                arrival_time = time_matches[0]
+                departure_time = time_matches[1]
+                
+                # Enhanced location extraction - look for text between or after times
+                location_patterns = [
+                    # Location between two times
+                    r'\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?\s+([A-Za-z\s\-]{3,30})\s+\b\d{1,2}[:.]\d{2}',
+                    # Location after two times
+                    r'\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?\s+\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?\s+([A-Za-z\s\-]{3,30})',
+                    # Location before times
+                    r'([A-Za-z\s\-]{3,30})\s+\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?\s+\b\d{1,2}[:.]\d{2}',
+                ]
+                
+                location = ""
+                for loc_pattern in location_patterns:
+                    location_match = re.search(loc_pattern, line, re.IGNORECASE)
+                    if location_match:
+                        location = location_match.group(1).strip()
+                        break
+                
+                # Look for notes/details
+                notes_matches = []
+                # Look for reference numbers (6-10 digits)
+                ref_match = re.search(r'([0-9]{6,10})', line)
+                if ref_match:
+                    notes_matches.append(ref_match.group(1))
+                
+                notes = ' | '.join(notes_matches) if notes_matches else ""
+                
+                rows.append({
+                    'time_arrived': arrival_time,
+                    'time_departed': departure_time,
+                    'location': location,
+                    'notes': notes
+                })
+            
+            elif len(time_matches) == 1:
+                # Single time - might be arrival only, but look harder for departure time
+                time_val = time_matches[0]
+                
+                # Look for location near the time
+                location_patterns = [
+                    r'\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?\s+([A-Za-z\s\-]{3,30})',
+                    r'([A-Za-z\s\-]{3,30})\s+\b\d{1,2}[:.]\d{2}(?:\s*(?:AM|PM|am|pm))?',
+                ]
+                
+                location = ""
+                for loc_pattern in location_patterns:
+                    location_match = re.search(loc_pattern, line, re.IGNORECASE)
+                    if location_match:
+                        location = location_match.group(1).strip()
+                        break
+                
+                if location:
+                    rows.append({
+                        'time_arrived': time_val,
+                        'time_departed': None,
+                        'location': location,
+                        'notes': ""
+                    })
+        
+        return rows
+
+    def _clean_location(self, location: str) -> str:
+        """Clean and correct location names."""
+        if not location:
+            return location
+            
+        location = location.strip()
+        
+        # Apply direct corrections
+        for mistake, correction in LOCATION_CORRECTIONS.items():
+            if mistake.lower() in location.lower():
+                print(f"🔧 Corrected location '{mistake}' to '{correction}'")
+                return correction
+        
+        # Apply fuzzy matching
+        if KNOWN_LOCATIONS:
+            match_result = process.extractOne(location, KNOWN_LOCATIONS, scorer=fuzz.partial_ratio)
+            if match_result and match_result[1] >= 70:
+                if match_result[0] != location:
+                    print(f"🎯 Fuzzy matched location '{location}' to '{match_result[0]}' (score: {match_result[1]})")
+                return match_result[0]
+        
+        return location
+
+    def _correct_and_match_driver_name(self, name: str) -> str:
+        """Apply corrections and fuzzy matching to driver names."""
+        if not name:
+            return name
+            
+        # Apply direct corrections
+        for mistake, correction in DRIVER_NAME_CORRECTIONS.items():
+            if mistake.lower() in name.lower():
+                if correction:  # Don't return empty corrections
+                    print(f"🔧 Corrected driver '{mistake}' to '{correction}'")
+                    return correction
+        
+        # Apply fuzzy matching
+        if KNOWN_DRIVERS:
+            match_result = process.extractOne(name, KNOWN_DRIVERS, scorer=fuzz.ratio)
+            if match_result and match_result[1] >= 70:
+                if match_result[0] != name:
+                    print(f"🎯 Fuzzy matched driver '{name}' to '{match_result[0]}' (score: {match_result[1]})")
+                return match_result[0]
+        
+        return name.title()  # Capitalize properly as fallback
+
+    def _parse_date(self, date_str: str) -> Optional[date]:
+        """Parse a date string into a date object."""
+        if not date_str:
+            return None
+        
+        # Common date patterns
+        patterns = [
+            r'(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})',  # MM/DD/YY or MM/DD/YYYY
+            r'(\d{2,4})[-/](\d{1,2})[-/](\d{1,2})',  # YYYY/MM/DD
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, date_str.strip())
+            if match:
+                try:
+                    part1, part2, part3 = match.groups()
+                    
+                    # Try different interpretations
+                    if len(part1) == 4:  # YYYY/MM/DD
+                        year, month, day = int(part1), int(part2), int(part3)
+                    else:  # MM/DD/YY or MM/DD/YYYY
+                        month, day, year = int(part1), int(part2), int(part3)
+                        if year < 100:  # Two-digit year
+                            year += 2000
+                    
+                    return date(year, month, day)
+                except (ValueError, TypeError):
+                    continue
         
         return None

@@ -96,6 +96,22 @@ DRIVER_NAME_CORRECTIONS = {
     "MOBARAK": "Mobarak",
     "Labor Name": "",  # Remove this text when found
     "Labour Name": "",  # Remove this text when found
+    
+    # Additional corrections for form text contamination
+    "Time Started Work": "",
+    "Time Ended Work": "",
+    "Time Started": "",
+    "Time Ended": "",
+    "Instructions": "",
+    "Vehicle ID": "",
+    "Date": "",
+    "Work": "",
+    
+    # Driver name with form text mixed in
+    "Mobarok Time Started Work": "Mobarak",
+    "Time Started Work Time Ended W": "",
+    "Delowar Labor Name": "Delawar",
+    "Name": "",
 }
 
 # =============================================================================

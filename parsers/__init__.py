@@ -12,6 +12,7 @@ As a Python beginner, think of parsers as "translators" that:
 """
 
 from .driver_log_parser import DriverLogParser
+from .enhanced_driver_log_parser import EnhancedDriverLogParser
 
-# This allows easy importing like: from parsers import DriverLogParser
-__all__ = ["DriverLogParser"]
+# This allows easy importing like: from parsers import DriverLogParser, EnhancedDriverLogParser
+__all__ = ["DriverLogParser", "EnhancedDriverLogParser"]

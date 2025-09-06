@@ -29,7 +29,7 @@ from google.cloud import vision
 from google.cloud.vision_v1 import types
 
 # Our custom modules
-from parsers import DriverLogParser
+from parsers import EnhancedDriverLogParser
 from schemas import DriverLogData, LocationVisit
 
 
@@ -75,7 +75,7 @@ class OCRPipeline:
             raise RuntimeError(f"Failed to initialize Google Cloud Vision client: {e}")
         
         # Initialize our parser
-        self.parser = DriverLogParser()
+        self.parser = EnhancedDriverLogParser()
         
         # Create output directory if it doesn't exist
         Path(self.output_folder).mkdir(exist_ok=True)
